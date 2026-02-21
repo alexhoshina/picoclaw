@@ -356,7 +356,11 @@ func TestWeComBotHandleVerification(t *testing.T) {
 		nonce := "test_nonce"
 		signature := generateSignature("test_token", timestamp, nonce, encryptedEchostr)
 
-		req := httptest.NewRequest(http.MethodGet, "/webhook/wecom?msg_signature="+signature+"&timestamp="+timestamp+"&nonce="+nonce+"&echostr="+encryptedEchostr, nil)
+		req := httptest.NewRequest(
+			http.MethodGet,
+			"/webhook/wecom?msg_signature="+signature+"&timestamp="+timestamp+"&nonce="+nonce+"&echostr="+encryptedEchostr,
+			nil,
+		)
 		w := httptest.NewRecorder()
 
 		ch.handleVerification(context.Background(), w, req)
@@ -386,7 +390,11 @@ func TestWeComBotHandleVerification(t *testing.T) {
 		timestamp := "1234567890"
 		nonce := "test_nonce"
 
-		req := httptest.NewRequest(http.MethodGet, "/webhook/wecom?msg_signature=invalid_sig&timestamp="+timestamp+"&nonce="+nonce+"&echostr="+encryptedEchostr, nil)
+		req := httptest.NewRequest(
+			http.MethodGet,
+			"/webhook/wecom?msg_signature=invalid_sig&timestamp="+timestamp+"&nonce="+nonce+"&echostr="+encryptedEchostr,
+			nil,
+		)
 		w := httptest.NewRecorder()
 
 		ch.handleVerification(context.Background(), w, req)
@@ -435,7 +443,11 @@ func TestWeComBotHandleMessageCallback(t *testing.T) {
 		nonce := "test_nonce"
 		signature := generateSignature("test_token", timestamp, nonce, encrypted)
 
-		req := httptest.NewRequest(http.MethodPost, "/webhook/wecom?msg_signature="+signature+"&timestamp="+timestamp+"&nonce="+nonce, bytes.NewReader(wrapperData))
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/webhook/wecom?msg_signature="+signature+"&timestamp="+timestamp+"&nonce="+nonce,
+			bytes.NewReader(wrapperData),
+		)
 		w := httptest.NewRecorder()
 
 		ch.handleMessageCallback(context.Background(), w, req)
@@ -477,7 +489,11 @@ func TestWeComBotHandleMessageCallback(t *testing.T) {
 		nonce := "test_nonce"
 		signature := generateSignature("test_token", timestamp, nonce, encrypted)
 
-		req := httptest.NewRequest(http.MethodPost, "/webhook/wecom?msg_signature="+signature+"&timestamp="+timestamp+"&nonce="+nonce, bytes.NewReader(wrapperData))
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/webhook/wecom?msg_signature="+signature+"&timestamp="+timestamp+"&nonce="+nonce,
+			bytes.NewReader(wrapperData),
+		)
 		w := httptest.NewRecorder()
 
 		ch.handleMessageCallback(context.Background(), w, req)
@@ -506,7 +522,11 @@ func TestWeComBotHandleMessageCallback(t *testing.T) {
 		nonce := "test_nonce"
 		signature := generateSignature("test_token", timestamp, nonce, "")
 
-		req := httptest.NewRequest(http.MethodPost, "/webhook/wecom?msg_signature="+signature+"&timestamp="+timestamp+"&nonce="+nonce, strings.NewReader("invalid xml"))
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/webhook/wecom?msg_signature="+signature+"&timestamp="+timestamp+"&nonce="+nonce,
+			strings.NewReader("invalid xml"),
+		)
 		w := httptest.NewRecorder()
 
 		ch.handleMessageCallback(context.Background(), w, req)
@@ -528,7 +548,11 @@ func TestWeComBotHandleMessageCallback(t *testing.T) {
 		timestamp := "1234567890"
 		nonce := "test_nonce"
 
-		req := httptest.NewRequest(http.MethodPost, "/webhook/wecom?msg_signature=invalid_sig&timestamp="+timestamp+"&nonce="+nonce, bytes.NewReader(wrapperData))
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/webhook/wecom?msg_signature=invalid_sig&timestamp="+timestamp+"&nonce="+nonce,
+			bytes.NewReader(wrapperData),
+		)
 		w := httptest.NewRecorder()
 
 		ch.handleMessageCallback(context.Background(), w, req)
@@ -623,7 +647,11 @@ func TestWeComBotHandleWebhook(t *testing.T) {
 		nonce := "test_nonce"
 		signature := generateSignature("test_token", timestamp, nonce, encoded)
 
-		req := httptest.NewRequest(http.MethodGet, "/webhook/wecom?msg_signature="+signature+"&timestamp="+timestamp+"&nonce="+nonce+"&echostr="+encoded, nil)
+		req := httptest.NewRequest(
+			http.MethodGet,
+			"/webhook/wecom?msg_signature="+signature+"&timestamp="+timestamp+"&nonce="+nonce+"&echostr="+encoded,
+			nil,
+		)
 		w := httptest.NewRecorder()
 
 		ch.handleWebhook(w, req)
@@ -646,7 +674,11 @@ func TestWeComBotHandleWebhook(t *testing.T) {
 		nonce := "test_nonce"
 		signature := generateSignature("test_token", timestamp, nonce, encryptedWrapper.Encrypt)
 
-		req := httptest.NewRequest(http.MethodPost, "/webhook/wecom?msg_signature="+signature+"&timestamp="+timestamp+"&nonce="+nonce, bytes.NewReader(wrapperData))
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/webhook/wecom?msg_signature="+signature+"&timestamp="+timestamp+"&nonce="+nonce,
+			bytes.NewReader(wrapperData),
+		)
 		w := httptest.NewRecorder()
 
 		ch.handleWebhook(w, req)
