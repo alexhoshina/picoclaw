@@ -73,8 +73,8 @@ func gatewayCmd() {
 	// Print agent startup info
 	fmt.Println("\n📦 Agent Status:")
 	startupInfo := agentLoop.GetStartupInfo()
-	toolsInfo := startupInfo["tools"].(map[string]interface{})
-	skillsInfo := startupInfo["skills"].(map[string]interface{})
+	toolsInfo := startupInfo["tools"].(map[string]any)
+	skillsInfo := startupInfo["skills"].(map[string]any)
 	fmt.Printf("  • Tools: %d loaded\n", toolsInfo["count"])
 	fmt.Printf("  • Skills: %d/%d available\n",
 		skillsInfo["available"],
@@ -82,7 +82,7 @@ func gatewayCmd() {
 
 	// Log to file as well
 	logger.InfoCF("agent", "Agent initialized",
-		map[string]interface{}{
+		map[string]any{
 			"tools_count":      toolsInfo["count"],
 			"skills_total":     skillsInfo["total"],
 			"skills_available": skillsInfo["available"],
@@ -90,7 +90,14 @@ func gatewayCmd() {
 
 	// Setup cron tool and service
 	execTimeout := time.Duration(cfg.Tools.Cron.ExecTimeoutMinutes) * time.Minute
-	cronService := setupCronTool(agentLoop, msgBus, cfg.WorkspacePath(), cfg.Agents.Defaults.RestrictToWorkspace, execTimeout, cfg)
+	cronService := setupCronTool(
+		agentLoop,
+		msgBus,
+		cfg.WorkspacePath(),
+		cfg.Agents.Defaults.RestrictToWorkspace,
+		execTimeout,
+		cfg,
+	)
 
 	heartbeatService := heartbeat.NewHeartbeatService(
 		cfg.WorkspacePath(),
@@ -104,7 +111,8 @@ func gatewayCmd() {
 			channel, chatID = "cli", "direct"
 		}
 		// Use ProcessHeartbeat - no session history, each heartbeat is independent
-		response, err := agentLoop.ProcessHeartbeat(context.Background(), prompt, channel, chatID)
+		var response string
+		response, err = agentLoop.ProcessHeartbeat(context.Background(), prompt, channel, chatID)
 		if err != nil {
 			return tools.ErrorResult(fmt.Sprintf("Heartbeat error: %v", err))
 		}
@@ -194,7 +202,7 @@ func gatewayCmd() {
 	healthServer := health.NewServer(cfg.Gateway.Host, cfg.Gateway.Port)
 	go func() {
 		if err := healthServer.Start(); err != nil && err != http.ErrServerClosed {
-			logger.ErrorCF("health", "Health server error", map[string]interface{}{"error": err.Error()})
+			logger.ErrorCF("health", "Health server error", map[string]any{"error": err.Error()})
 		}
 	}()
 	fmt.Printf("✓ Health endpoints available at http://%s:%d/health and /ready\n", cfg.Gateway.Host, cfg.Gateway.Port)
@@ -216,7 +224,14 @@ func gatewayCmd() {
 	fmt.Println("✓ Gateway stopped")
 }
 
-func setupCronTool(agentLoop *agent.AgentLoop, msgBus *bus.MessageBus, workspace string, restrict bool, execTimeout time.Duration, cfg *config.Config) *cron.CronService {
+func setupCronTool(
+	agentLoop *agent.AgentLoop,
+	msgBus *bus.MessageBus,
+	workspace string,
+	restrict bool,
+	execTimeout time.Duration,
+	cfg *config.Config,
+) *cron.CronService {
 	cronStorePath := filepath.Join(workspace, "cron", "jobs.json")
 
 	// Create cron service
