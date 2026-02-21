@@ -18,7 +18,6 @@ import (
 	"testing"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
-	"github.com/sipeed/picoclaw/pkg/channels"
 	"github.com/sipeed/picoclaw/pkg/config"
 )
 
@@ -196,10 +195,8 @@ func TestWeComBotVerifySignature(t *testing.T) {
 			Token:      "",
 			WebhookURL: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test",
 		}
-		base := channels.NewBaseChannel("wecom", cfgEmpty, msgBus, cfgEmpty.AllowFrom)
 		chEmpty := &WeComBotChannel{
-			BaseChannel: base,
-			config:      cfgEmpty,
+			config: cfgEmpty,
 		}
 
 		if !verifySignature(chEmpty.config.Token, "any_sig", "any_ts", "any_nonce", "any_msg") {

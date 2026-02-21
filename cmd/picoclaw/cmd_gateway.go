@@ -15,7 +15,6 @@ import (
 	"github.com/sipeed/picoclaw/pkg/agent"
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/channels"
-	// Channel factory registrations (blank imports trigger init())
 	_ "github.com/sipeed/picoclaw/pkg/channels/dingtalk"
 	dch "github.com/sipeed/picoclaw/pkg/channels/discord"
 	_ "github.com/sipeed/picoclaw/pkg/channels/feishu"
