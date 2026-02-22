@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/sipeed/picoclaw/pkg/agent"
@@ -133,7 +134,9 @@ func gatewayCmd() {
 
 	// Inject channel manager and media store into agent loop
 	agentLoop.SetChannelManager(channelManager)
+
 	agentLoop.SetMediaStore(mediaStore)
+
 
 	enabledChannels := channelManager.GetEnabledChannels()
 	if len(enabledChannels) > 0 {
