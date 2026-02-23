@@ -121,12 +121,13 @@ func registerSharedTools(
 		// Message tool
 		messageTool := tools.NewMessageTool()
 		messageTool.SetSendCallback(func(channel, chatID, content string) error {
-			msgBus.PublishOutbound(context.TODO(), bus.OutboundMessage{
+			pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer pubCancel()
+			return msgBus.PublishOutbound(pubCtx, bus.OutboundMessage{
 				Channel: channel,
 				ChatID:  chatID,
 				Content: content,
 			})
-			return nil
 		})
 		agent.Tools.Register(messageTool)
 
@@ -835,7 +836,9 @@ func (al *AgentLoop) maybeSummarize(agent *AgentInstance, sessionKey, channel, c
 			go func() {
 				defer al.summarizing.Delete(summarizeKey)
 				if !constants.IsInternalChannel(channel) {
-					al.bus.PublishOutbound(context.TODO(), bus.OutboundMessage{
+					pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer pubCancel()
+					al.bus.PublishOutbound(pubCtx, bus.OutboundMessage{
 						Channel: channel,
 						ChatID:  chatID,
 						Content: "Memory threshold reached. Optimizing conversation history...",
