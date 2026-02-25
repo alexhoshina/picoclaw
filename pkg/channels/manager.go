@@ -8,7 +8,6 @@ package channels
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -408,68 +407,6 @@ func (m *Manager) runWorker(ctx context.Context, name string, w *channelWorker) 
 	}
 }
 
-// sendWithRetry sends a message through the channel with rate limiting and
-// retry logic. It classifies errors to determine the retry strategy:
-//   - ErrNotRunning / ErrSendFailed: permanent, no retry
-//   - ErrRateLimit: fixed delay retry
-//   - ErrTemporary / unknown: exponential backoff retry
-func (m *Manager) sendWithRetry(ctx context.Context, name string, w *channelWorker, msg bus.OutboundMessage) {
-	// Rate limit: wait for token
-	if err := w.limiter.Wait(ctx); err != nil {
-		// ctx cancelled, shutting down
-		return
-	}
-
-	// Pre-send: stop typing and try to edit placeholder
-	if m.preSend(ctx, name, msg, w.ch) {
-		return // placeholder was edited successfully, skip Send
-	}
-
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		lastErr = w.ch.Send(ctx, msg)
-		if lastErr == nil {
-			return
-		}
-
-		// Permanent failures — don't retry
-		if errors.Is(lastErr, ErrNotRunning) || errors.Is(lastErr, ErrSendFailed) {
-			break
-		}
-
-		// Last attempt exhausted — don't sleep
-		if attempt == maxRetries {
-			break
-		}
-
-		// Rate limit error — fixed delay
-		if errors.Is(lastErr, ErrRateLimit) {
-			select {
-			case <-time.After(rateLimitDelay):
-				continue
-			case <-ctx.Done():
-				return
-			}
-		}
-
-		// ErrTemporary or unknown error — exponential backoff
-		backoff := min(time.Duration(float64(baseBackoff)*math.Pow(2, float64(attempt))), maxBackoff)
-		select {
-		case <-time.After(backoff):
-		case <-ctx.Done():
-			return
-		}
-	}
-
-	// All retries exhausted or permanent failure
-	logger.ErrorCF("channels", "Send failed", map[string]any{
-		"channel": name,
-		"chat_id": msg.ChatID,
-		"error":   lastErr.Error(),
-		"retries": maxRetries,
-	})
-}
-
 func (m *Manager) dispatchOutbound(ctx context.Context) {
 	logger.InfoC("channels", "Outbound dispatcher started")
 
@@ -566,67 +503,6 @@ func (m *Manager) runMediaWorker(ctx context.Context, name string, w *channelWor
 			return
 		}
 	}
-}
-
-// sendMediaWithRetry sends a media message through the channel with rate limiting and
-// retry logic. If the channel does not implement MediaSender, it silently skips.
-func (m *Manager) sendMediaWithRetry(ctx context.Context, name string, w *channelWorker, msg bus.OutboundMediaMessage) {
-	ms, ok := w.ch.(MediaSender)
-	if !ok {
-		logger.DebugCF("channels", "Channel does not support MediaSender, skipping media", map[string]any{
-			"channel": name,
-		})
-		return
-	}
-
-	// Rate limit: wait for token
-	if err := w.limiter.Wait(ctx); err != nil {
-		return
-	}
-
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		lastErr = ms.SendMedia(ctx, msg)
-		if lastErr == nil {
-			return
-		}
-
-		// Permanent failures — don't retry
-		if errors.Is(lastErr, ErrNotRunning) || errors.Is(lastErr, ErrSendFailed) {
-			break
-		}
-
-		// Last attempt exhausted — don't sleep
-		if attempt == maxRetries {
-			break
-		}
-
-		// Rate limit error — fixed delay
-		if errors.Is(lastErr, ErrRateLimit) {
-			select {
-			case <-time.After(rateLimitDelay):
-				continue
-			case <-ctx.Done():
-				return
-			}
-		}
-
-		// ErrTemporary or unknown error — exponential backoff
-		backoff := min(time.Duration(float64(baseBackoff)*math.Pow(2, float64(attempt))), maxBackoff)
-		select {
-		case <-time.After(backoff):
-		case <-ctx.Done():
-			return
-		}
-	}
-
-	// All retries exhausted or permanent failure
-	logger.ErrorCF("channels", "SendMedia failed", map[string]any{
-		"channel": name,
-		"chat_id": msg.ChatID,
-		"error":   lastErr.Error(),
-		"retries": maxRetries,
-	})
 }
 
 // runTTLJanitor periodically scans the typingStops and placeholders maps
