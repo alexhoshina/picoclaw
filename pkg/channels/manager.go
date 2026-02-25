@@ -60,6 +60,13 @@ type asyncTask struct {
 	cancel context.CancelFunc
 }
 
+// channelSpec defines a channel initialization specification for table-driven init.
+type channelSpec struct {
+	key         string // internal channel name (e.g., "telegram")
+	displayName string // user-facing name (e.g., "Telegram")
+	ready       func(*config.Config) bool
+}
+
 // RecordPlaceholder registers a placeholder message for later editing.
 // Implements PlaceholderRecorder.
 func (m *Manager) RecordPlaceholder(channel, chatID, placeholderID string) {
@@ -129,56 +136,81 @@ func (m *Manager) initChannel(name, displayName string) {
 func (m *Manager) initChannels() error {
 	logger.InfoC("channels", "Initializing channel manager")
 
-	if m.config.Channels.Telegram.Enabled && m.config.Channels.Telegram.Token != "" {
-		m.initChannel("telegram", "Telegram")
+	// Table-driven channel initialization (reduces cyclomatic complexity from 24→3)
+	specs := []channelSpec{
+		{
+			key:         "telegram",
+			displayName: "Telegram",
+			ready:       func(c *config.Config) bool { return c.Channels.Telegram.Enabled && c.Channels.Telegram.Token != "" },
+		},
+		{
+			key:         "whatsapp",
+			displayName: "WhatsApp",
+			ready:       func(c *config.Config) bool { return c.Channels.WhatsApp.Enabled && c.Channels.WhatsApp.BridgeURL != "" },
+		},
+		{
+			key:         "feishu",
+			displayName: "Feishu",
+			ready:       func(c *config.Config) bool { return c.Channels.Feishu.Enabled },
+		},
+		{
+			key:         "discord",
+			displayName: "Discord",
+			ready:       func(c *config.Config) bool { return c.Channels.Discord.Enabled && c.Channels.Discord.Token != "" },
+		},
+		{
+			key:         "maixcam",
+			displayName: "MaixCam",
+			ready:       func(c *config.Config) bool { return c.Channels.MaixCam.Enabled },
+		},
+		{
+			key:         "qq",
+			displayName: "QQ",
+			ready:       func(c *config.Config) bool { return c.Channels.QQ.Enabled },
+		},
+		{
+			key:         "dingtalk",
+			displayName: "DingTalk",
+			ready:       func(c *config.Config) bool { return c.Channels.DingTalk.Enabled && c.Channels.DingTalk.ClientID != "" },
+		},
+		{
+			key:         "slack",
+			displayName: "Slack",
+			ready:       func(c *config.Config) bool { return c.Channels.Slack.Enabled && c.Channels.Slack.BotToken != "" },
+		},
+		{
+			key:         "line",
+			displayName: "LINE",
+			ready: func(c *config.Config) bool {
+				return c.Channels.LINE.Enabled && c.Channels.LINE.ChannelAccessToken != ""
+			},
+		},
+		{
+			key:         "onebot",
+			displayName: "OneBot",
+			ready:       func(c *config.Config) bool { return c.Channels.OneBot.Enabled && c.Channels.OneBot.WSUrl != "" },
+		},
+		{
+			key:         "wecom",
+			displayName: "WeCom",
+			ready:       func(c *config.Config) bool { return c.Channels.WeCom.Enabled && c.Channels.WeCom.Token != "" },
+		},
+		{
+			key:         "wecom_app",
+			displayName: "WeCom App",
+			ready:       func(c *config.Config) bool { return c.Channels.WeComApp.Enabled && c.Channels.WeComApp.CorpID != "" },
+		},
+		{
+			key:         "pico",
+			displayName: "Pico",
+			ready:       func(c *config.Config) bool { return c.Channels.Pico.Enabled && c.Channels.Pico.Token != "" },
+		},
 	}
 
-	if m.config.Channels.WhatsApp.Enabled && m.config.Channels.WhatsApp.BridgeURL != "" {
-		m.initChannel("whatsapp", "WhatsApp")
-	}
-
-	if m.config.Channels.Feishu.Enabled {
-		m.initChannel("feishu", "Feishu")
-	}
-
-	if m.config.Channels.Discord.Enabled && m.config.Channels.Discord.Token != "" {
-		m.initChannel("discord", "Discord")
-	}
-
-	if m.config.Channels.MaixCam.Enabled {
-		m.initChannel("maixcam", "MaixCam")
-	}
-
-	if m.config.Channels.QQ.Enabled {
-		m.initChannel("qq", "QQ")
-	}
-
-	if m.config.Channels.DingTalk.Enabled && m.config.Channels.DingTalk.ClientID != "" {
-		m.initChannel("dingtalk", "DingTalk")
-	}
-
-	if m.config.Channels.Slack.Enabled && m.config.Channels.Slack.BotToken != "" {
-		m.initChannel("slack", "Slack")
-	}
-
-	if m.config.Channels.LINE.Enabled && m.config.Channels.LINE.ChannelAccessToken != "" {
-		m.initChannel("line", "LINE")
-	}
-
-	if m.config.Channels.OneBot.Enabled && m.config.Channels.OneBot.WSUrl != "" {
-		m.initChannel("onebot", "OneBot")
-	}
-
-	if m.config.Channels.WeCom.Enabled && m.config.Channels.WeCom.Token != "" {
-		m.initChannel("wecom", "WeCom")
-	}
-
-	if m.config.Channels.WeComApp.Enabled && m.config.Channels.WeComApp.CorpID != "" {
-		m.initChannel("wecom_app", "WeCom App")
-	}
-
-	if m.config.Channels.Pico.Enabled && m.config.Channels.Pico.Token != "" {
-		m.initChannel("pico", "Pico")
+	for _, s := range specs {
+		if s.ready(m.config) {
+			m.initChannel(s.key, s.displayName)
+		}
 	}
 
 	logger.InfoCF("channels", "Channel initialization completed", map[string]any{
@@ -225,86 +257,79 @@ func (m *Manager) SetupHTTPServer(addr string, healthServer *health.Server) {
 	}
 }
 
-func (m *Manager) dispatchOutbound(ctx context.Context) {
-	logger.InfoC("channels", "Outbound dispatcher started")
+// dispatchGeneric is a generic dispatcher that handles both OutboundMessage and OutboundMediaMessage.
+// It eliminates code duplication between dispatchOutbound and dispatchOutboundMedia.
+func dispatchGeneric[T any](
+	m *Manager,
+	ctx context.Context,
+	subscribe func(context.Context) (T, bool),
+	getChannel func(T) string,
+	getQueue func(*channelWorker) chan T,
+	logName string,
+) {
+	logger.InfoCF("channels", logName+" started", nil)
 
 	for {
-		msg, ok := m.bus.SubscribeOutbound(ctx)
+		msg, ok := subscribe(ctx)
 		if !ok {
-			logger.InfoC("channels", "Outbound dispatcher stopped")
+			logger.InfoCF("channels", logName+" stopped", nil)
 			return
 		}
 
+		channel := getChannel(msg)
+
 		// Silently skip internal channels
-		if constants.IsInternalChannel(msg.Channel) {
+		if constants.IsInternalChannel(channel) {
 			continue
 		}
 
 		m.mu.RLock()
-		_, exists := m.channels[msg.Channel]
-		w, wExists := m.workers[msg.Channel]
+		_, exists := m.channels[channel]
+		w, wExists := m.workers[channel]
 		m.mu.RUnlock()
 
 		if !exists {
-			logger.WarnCF("channels", "Unknown channel for outbound message", map[string]any{
-				"channel": msg.Channel,
+			logger.WarnCF("channels", "Unknown channel for "+logName, map[string]any{
+				"channel": channel,
 			})
 			continue
 		}
 
 		if wExists && w != nil {
+			queue := getQueue(w)
 			select {
-			case w.queue <- msg:
+			case queue <- msg:
 			case <-ctx.Done():
 				return
 			}
 		} else if exists {
 			logger.WarnCF("channels", "Channel has no active worker, skipping message", map[string]any{
-				"channel": msg.Channel,
+				"channel": channel,
 			})
 		}
 	}
 }
 
+func (m *Manager) dispatchOutbound(ctx context.Context) {
+	dispatchGeneric(
+		m,
+		ctx,
+		m.bus.SubscribeOutbound,
+		func(msg bus.OutboundMessage) string { return msg.Channel },
+		func(w *channelWorker) chan bus.OutboundMessage { return w.queue },
+		"Outbound dispatcher",
+	)
+}
+
 func (m *Manager) dispatchOutboundMedia(ctx context.Context) {
-	logger.InfoC("channels", "Outbound media dispatcher started")
-
-	for {
-		msg, ok := m.bus.SubscribeOutboundMedia(ctx)
-		if !ok {
-			logger.InfoC("channels", "Outbound media dispatcher stopped")
-			return
-		}
-
-		// Silently skip internal channels
-		if constants.IsInternalChannel(msg.Channel) {
-			continue
-		}
-
-		m.mu.RLock()
-		_, exists := m.channels[msg.Channel]
-		w, wExists := m.workers[msg.Channel]
-		m.mu.RUnlock()
-
-		if !exists {
-			logger.WarnCF("channels", "Unknown channel for outbound media message", map[string]any{
-				"channel": msg.Channel,
-			})
-			continue
-		}
-
-		if wExists && w != nil {
-			select {
-			case w.mediaQueue <- msg:
-			case <-ctx.Done():
-				return
-			}
-		} else if exists {
-			logger.WarnCF("channels", "Channel has no active worker, skipping media message", map[string]any{
-				"channel": msg.Channel,
-			})
-		}
-	}
+	dispatchGeneric(
+		m,
+		ctx,
+		m.bus.SubscribeOutboundMedia,
+		func(msg bus.OutboundMediaMessage) string { return msg.Channel },
+		func(w *channelWorker) chan bus.OutboundMediaMessage { return w.mediaQueue },
+		"Outbound media dispatcher",
+	)
 }
 
 func (m *Manager) GetChannel(name string) (Channel, bool) {
