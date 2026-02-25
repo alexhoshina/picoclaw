@@ -9,12 +9,9 @@ package channels
 import (
 	"context"
 	"fmt"
-	"math"
 	"net/http"
 	"sync"
 	"time"
-
-	"golang.org/x/time/rate"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/config"
@@ -43,15 +40,6 @@ var channelRateConfig = map[string]float64{
 	"discord":  1,
 	"slack":    1,
 	"line":     10,
-}
-
-type channelWorker struct {
-	ch         Channel
-	queue      chan bus.OutboundMessage
-	mediaQueue chan bus.OutboundMediaMessage
-	done       chan struct{}
-	mediaDone  chan struct{}
-	limiter    *rate.Limiter
 }
 
 type Manager struct {
@@ -358,55 +346,6 @@ func (m *Manager) StopAll(ctx context.Context) error {
 	return nil
 }
 
-// newChannelWorker creates a channelWorker with a rate limiter configured
-// for the given channel name.
-func newChannelWorker(name string, ch Channel) *channelWorker {
-	rateVal := float64(defaultRateLimit)
-	if r, ok := channelRateConfig[name]; ok {
-		rateVal = r
-	}
-	burst := int(math.Max(1, math.Ceil(rateVal/2)))
-
-	return &channelWorker{
-		ch:         ch,
-		queue:      make(chan bus.OutboundMessage, defaultChannelQueueSize),
-		mediaQueue: make(chan bus.OutboundMediaMessage, defaultChannelQueueSize),
-		done:       make(chan struct{}),
-		mediaDone:  make(chan struct{}),
-		limiter:    rate.NewLimiter(rate.Limit(rateVal), burst),
-	}
-}
-
-// runWorker processes outbound messages for a single channel, splitting
-// messages that exceed the channel's maximum message length.
-func (m *Manager) runWorker(ctx context.Context, name string, w *channelWorker) {
-	defer close(w.done)
-	for {
-		select {
-		case msg, ok := <-w.queue:
-			if !ok {
-				return
-			}
-			maxLen := 0
-			if mlp, ok := w.ch.(MessageLengthProvider); ok {
-				maxLen = mlp.MaxMessageLength()
-			}
-			if maxLen > 0 && len([]rune(msg.Content)) > maxLen {
-				chunks := SplitMessage(msg.Content, maxLen)
-				for _, chunk := range chunks {
-					chunkMsg := msg
-					chunkMsg.Content = chunk
-					m.sendWithRetry(ctx, name, w, chunkMsg)
-				}
-			} else {
-				m.sendWithRetry(ctx, name, w, msg)
-			}
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
 func (m *Manager) dispatchOutbound(ctx context.Context) {
 	logger.InfoC("channels", "Outbound dispatcher started")
 
@@ -485,22 +424,6 @@ func (m *Manager) dispatchOutboundMedia(ctx context.Context) {
 			logger.WarnCF("channels", "Channel has no active worker, skipping media message", map[string]any{
 				"channel": msg.Channel,
 			})
-		}
-	}
-}
-
-// runMediaWorker processes outbound media messages for a single channel.
-func (m *Manager) runMediaWorker(ctx context.Context, name string, w *channelWorker) {
-	defer close(w.mediaDone)
-	for {
-		select {
-		case msg, ok := <-w.mediaQueue:
-			if !ok {
-				return
-			}
-			m.sendMediaWithRetry(ctx, name, w, msg)
-		case <-ctx.Done():
-			return
 		}
 	}
 }
