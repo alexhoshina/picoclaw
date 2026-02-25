@@ -38,18 +38,6 @@ const (
 	placeholderTTL  = 10 * time.Minute
 )
 
-// typingEntry wraps a typing stop function with a creation timestamp for TTL eviction.
-type typingEntry struct {
-	stop      func()
-	createdAt time.Time
-}
-
-// placeholderEntry wraps a placeholder ID with a creation timestamp for TTL eviction.
-type placeholderEntry struct {
-	id        string
-	createdAt time.Time
-}
-
 // channelRateConfig maps channel name to per-second rate limit.
 var channelRateConfig = map[string]float64{
 	"telegram": 20,
@@ -97,33 +85,6 @@ func (m *Manager) RecordPlaceholder(channel, chatID, placeholderID string) {
 func (m *Manager) RecordTypingStop(channel, chatID string, stop func()) {
 	key := channel + ":" + chatID
 	m.typingStops.Store(key, typingEntry{stop: stop, createdAt: time.Now()})
-}
-
-// preSend handles typing stop and placeholder editing before sending a message.
-// Returns true if the message was edited into a placeholder (skip Send).
-func (m *Manager) preSend(ctx context.Context, name string, msg bus.OutboundMessage, ch Channel) bool {
-	key := name + ":" + msg.ChatID
-
-	// 1. Stop typing
-	if v, loaded := m.typingStops.LoadAndDelete(key); loaded {
-		if entry, ok := v.(typingEntry); ok {
-			entry.stop() // idempotent, safe
-		}
-	}
-
-	// 2. Try editing placeholder
-	if v, loaded := m.placeholders.LoadAndDelete(key); loaded {
-		if entry, ok := v.(placeholderEntry); ok && entry.id != "" {
-			if editor, ok := ch.(MessageEditor); ok {
-				if err := editor.EditMessage(ctx, msg.ChatID, entry.id, msg.Content); err == nil {
-					return true // edited successfully, skip Send
-				}
-				// edit failed → fall through to normal Send
-			}
-		}
-	}
-
-	return false
 }
 
 func NewManager(cfg *config.Config, messageBus *bus.MessageBus, store media.MediaStore) (*Manager, error) {
