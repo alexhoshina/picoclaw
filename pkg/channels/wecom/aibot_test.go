@@ -146,9 +146,13 @@ func TestWeComAIBotChannelGetStreamResponseProcessingMessage(t *testing.T) {
 		}
 
 		messageBus := bus.NewMessageBus()
-		ch, err := NewWeComAIBotChannel(cfg, messageBus)
+		channel, err := NewWeComAIBotChannel(cfg, messageBus)
 		if err != nil {
 			t.Fatalf("Failed to create channel: %v", err)
+		}
+		ch, ok := channel.(*WeComAIBotChannel)
+		if !ok {
+			t.Fatal("Expected webhook mode channel")
 		}
 
 		task := &streamTask{
@@ -189,9 +193,13 @@ func TestWeComAIBotChannelGetStreamResponseProcessingMessage(t *testing.T) {
 		}
 
 		messageBus := bus.NewMessageBus()
-		ch, err := NewWeComAIBotChannel(cfg, messageBus)
+		channel, err := NewWeComAIBotChannel(cfg, messageBus)
 		if err != nil {
 			t.Fatalf("Failed to create channel: %v", err)
+		}
+		ch, ok := channel.(*WeComAIBotChannel)
+		if !ok {
+			t.Fatal("Expected webhook mode channel")
 		}
 
 		task := &streamTask{
