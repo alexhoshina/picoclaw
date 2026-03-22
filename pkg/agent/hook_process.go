@@ -2,8 +2,10 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,13 +15,19 @@ import (
 	"time"
 
 	"github.com/sipeed/picoclaw/pkg/logger"
+	"github.com/sipeed/picoclaw/pkg/providers"
+	"github.com/sipeed/picoclaw/pkg/providers/protocoltypes"
 )
 
 const (
 	processHookJSONRPCVersion = "2.0"
 	processHookReadBufferSize = 1024 * 1024
 	processHookCloseTimeout   = 2 * time.Second
+	processHookStderrLogLimit = 64 * 1024
+	processHookStderrBufSize  = 16 * 1024
 )
+
+var processHookHelloTimeout = 5 * time.Second
 
 type ProcessHookOptions struct {
 	Command       []string
@@ -85,7 +93,7 @@ type processHookBeforeLLMResponse struct {
 
 type processHookAfterLLMResponse struct {
 	processHookDecisionResponse
-	Response *LLMHookResponse `json:"response,omitempty"`
+	Response *processHookLLMHookResponse `json:"response,omitempty"`
 }
 
 type processHookBeforeToolResponse struct {
@@ -96,6 +104,41 @@ type processHookBeforeToolResponse struct {
 type processHookAfterToolResponse struct {
 	processHookDecisionResponse
 	Result *ToolResultHookResponse `json:"result,omitempty"`
+}
+
+type processHookToolCall struct {
+	ID               string                  `json:"id,omitempty"`
+	Type             string                  `json:"type,omitempty"`
+	Function         *providers.FunctionCall `json:"function,omitempty"`
+	Name             string                  `json:"name,omitempty"`
+	Arguments        map[string]any          `json:"arguments,omitempty"`
+	ThoughtSignature string                  `json:"thought_signature,omitempty"`
+	ExtraContent     *providers.ExtraContent `json:"extra_content,omitempty"`
+}
+
+type processHookLLMResponsePayload struct {
+	Content          string                          `json:"content"`
+	ReasoningContent string                          `json:"reasoning_content,omitempty"`
+	ToolCalls        []processHookToolCall           `json:"tool_calls,omitempty"`
+	FinishReason     string                          `json:"finish_reason"`
+	Usage            *providers.UsageInfo            `json:"usage,omitempty"`
+	Reasoning        string                          `json:"reasoning"`
+	ReasoningDetails []protocoltypes.ReasoningDetail `json:"reasoning_details"`
+}
+
+type processHookLLMHookResponse struct {
+	Meta     EventMeta                      `json:"meta"`
+	Model    string                         `json:"model"`
+	Response *processHookLLMResponsePayload `json:"response,omitempty"`
+	Channel  string                         `json:"channel,omitempty"`
+	ChatID   string                         `json:"chat_id,omitempty"`
+}
+
+type processHookEventPayload struct {
+	Kind    string    `json:"Kind"`
+	Time    time.Time `json:"Time"`
+	Meta    EventMeta `json:"Meta"`
+	Payload any       `json:"Payload,omitempty"`
 }
 
 func NewProcessHook(ctx context.Context, name string, opts ProcessHookOptions) (*ProcessHook, error) {
@@ -138,12 +181,12 @@ func NewProcessHook(ctx context.Context, name string, opts ProcessHookOptions) (
 	go ph.readStderr(stderr)
 	go ph.waitLoop()
 
-	helloCtx := ctx
-	if helloCtx == nil {
-		var cancel context.CancelFunc
-		helloCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+	helloBaseCtx := ctx
+	if helloBaseCtx == nil {
+		helloBaseCtx = context.Background()
 	}
+	helloCtx, cancel := context.WithTimeout(helloBaseCtx, processHookHelloTimeout)
+	defer cancel()
 	if err := ph.hello(helloCtx); err != nil {
 		_ = ph.Close()
 		return nil, err
@@ -187,7 +230,12 @@ func (ph *ProcessHook) OnEvent(ctx context.Context, evt Event) error {
 			return nil
 		}
 	}
-	return ph.notify(ctx, "hook.event", evt)
+	return ph.notify(ctx, "hook.event", processHookEventPayload{
+		Kind:    evt.Kind.String(),
+		Time:    evt.Time,
+		Meta:    evt.Meta,
+		Payload: evt.Payload,
+	})
 }
 
 func (ph *ProcessHook) BeforeLLM(
@@ -217,13 +265,13 @@ func (ph *ProcessHook) AfterLLM(
 	}
 
 	var result processHookAfterLLMResponse
-	if err := ph.call(ctx, "hook.after_llm", resp, &result); err != nil {
+	if err := ph.call(ctx, "hook.after_llm", processHookLLMHookResponseFrom(resp), &result); err != nil {
 		return nil, HookDecision{}, err
 	}
 	if result.Response == nil {
-		result.Response = resp
+		result.Response = processHookLLMHookResponseFrom(resp)
 	}
-	return result.Response, HookDecision{Action: result.Action, Reason: result.Reason}, nil
+	return result.Response.toLLMHookResponse(), HookDecision{Action: result.Action, Reason: result.Reason}, nil
 }
 
 func (ph *ProcessHook) BeforeTool(
@@ -389,6 +437,8 @@ func (ph *ProcessHook) send(ctx context.Context, msg processHookRPCMessage) erro
 		}
 		return nil
 	case <-ctx.Done():
+		_ = ph.Close()
+		<-done
 		return ctx.Err()
 	}
 }
@@ -423,13 +473,91 @@ func (ph *ProcessHook) readLoop(stdout io.Reader) {
 }
 
 func (ph *ProcessHook) readStderr(stderr io.Reader) {
-	scanner := bufio.NewScanner(stderr)
-	scanner.Buffer(make([]byte, 0, 16*1024), processHookReadBufferSize)
-	for scanner.Scan() {
-		logger.WarnCF("hooks", "Process hook stderr", map[string]any{
+	reader := bufio.NewReaderSize(stderr, processHookStderrBufSize)
+
+	var (
+		lineBuf          []byte
+		remaining        = processHookStderrLogLimit
+		outputTruncated  bool
+		truncationWarned bool
+		lineTruncated    bool
+	)
+
+	flushLine := func() {
+		if len(lineBuf) == 0 && !lineTruncated {
+			return
+		}
+
+		fields := map[string]any{
 			"hook":   ph.name,
-			"stderr": scanner.Text(),
+			"stderr": string(bytes.TrimRight(lineBuf, "\r\n")),
+		}
+		if lineTruncated {
+			fields["truncated"] = true
+		}
+		logger.WarnCF("hooks", "Process hook stderr", fields)
+
+		lineBuf = lineBuf[:0]
+		lineTruncated = false
+	}
+
+	warnTruncated := func() {
+		if truncationWarned || !outputTruncated {
+			return
+		}
+		logger.WarnCF("hooks", "Process hook stderr output truncated", map[string]any{
+			"hook":        ph.name,
+			"limit_bytes": processHookStderrLogLimit,
 		})
+		truncationWarned = true
+	}
+
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if !outputTruncated {
+			if remaining > 0 {
+				take := len(fragment)
+				if take > remaining {
+					take = remaining
+				}
+				lineBuf = append(lineBuf, fragment[:take]...)
+				remaining -= take
+				if take < len(fragment) {
+					outputTruncated = true
+					if len(lineBuf) > 0 {
+						lineTruncated = true
+					}
+				}
+			} else if len(fragment) > 0 {
+				outputTruncated = true
+				if len(lineBuf) > 0 {
+					lineTruncated = true
+				}
+			}
+		}
+
+		switch {
+		case errors.Is(err, bufio.ErrBufferFull):
+			if outputTruncated && len(lineBuf) > 0 {
+				lineTruncated = true
+			}
+			continue
+		case err == nil:
+			flushLine()
+			warnTruncated()
+		case errors.Is(err, io.EOF):
+			flushLine()
+			warnTruncated()
+			return
+		default:
+			flushLine()
+			warnTruncated()
+			logger.WarnCF("hooks", "Process hook stderr stream failed", map[string]any{
+				"hook":  ph.name,
+				"error": err.Error(),
+			})
+			return
+		}
 	}
 }
 
@@ -508,4 +636,132 @@ func newProcessHookObserveKinds(kinds []string) map[string]struct{} {
 		return nil
 	}
 	return normalized
+}
+
+func processHookLLMHookResponseFrom(resp *LLMHookResponse) *processHookLLMHookResponse {
+	if resp == nil {
+		return nil
+	}
+
+	wire := &processHookLLMHookResponse{
+		Meta:    resp.Meta,
+		Model:   resp.Model,
+		Channel: resp.Channel,
+		ChatID:  resp.ChatID,
+	}
+	if resp.Response != nil {
+		response := &processHookLLMResponsePayload{
+			Content:          resp.Response.Content,
+			ReasoningContent: resp.Response.ReasoningContent,
+			ToolCalls:        processHookToolCallsFromProvider(resp.Response.ToolCalls),
+			FinishReason:     resp.Response.FinishReason,
+			Reasoning:        resp.Response.Reasoning,
+		}
+		if resp.Response.Usage != nil {
+			usage := *resp.Response.Usage
+			response.Usage = &usage
+		}
+		if len(resp.Response.ReasoningDetails) > 0 {
+			response.ReasoningDetails = append([]protocoltypes.ReasoningDetail(nil), resp.Response.ReasoningDetails...)
+		}
+		wire.Response = response
+	}
+	return wire
+}
+
+func (resp *processHookLLMHookResponse) toLLMHookResponse() *LLMHookResponse {
+	if resp == nil {
+		return nil
+	}
+
+	out := &LLMHookResponse{
+		Meta:    resp.Meta,
+		Model:   resp.Model,
+		Channel: resp.Channel,
+		ChatID:  resp.ChatID,
+	}
+	if resp.Response != nil {
+		response := &providers.LLMResponse{
+			Content:          resp.Response.Content,
+			ReasoningContent: resp.Response.ReasoningContent,
+			ToolCalls:        processHookToolCallsToProvider(resp.Response.ToolCalls),
+			FinishReason:     resp.Response.FinishReason,
+			Reasoning:        resp.Response.Reasoning,
+		}
+		if resp.Response.Usage != nil {
+			usage := *resp.Response.Usage
+			response.Usage = &usage
+		}
+		if len(resp.Response.ReasoningDetails) > 0 {
+			response.ReasoningDetails = append([]protocoltypes.ReasoningDetail(nil), resp.Response.ReasoningDetails...)
+		}
+		out.Response = response
+	}
+	return out
+}
+
+func processHookToolCallsFromProvider(calls []providers.ToolCall) []processHookToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+
+	wire := make([]processHookToolCall, len(calls))
+	for i, call := range calls {
+		normalized := providers.NormalizeToolCall(call)
+		wire[i] = processHookToolCall{
+			ID:               normalized.ID,
+			Type:             normalized.Type,
+			Name:             normalized.Name,
+			Arguments:        cloneStringAnyMap(normalized.Arguments),
+			ThoughtSignature: normalized.ThoughtSignature,
+			ExtraContent:     cloneProviderToolCalls([]providers.ToolCall{normalized})[0].ExtraContent,
+		}
+		if normalized.Function != nil {
+			function := *normalized.Function
+			wire[i].Function = &function
+			if wire[i].ThoughtSignature == "" {
+				wire[i].ThoughtSignature = function.ThoughtSignature
+			}
+		}
+	}
+	return wire
+}
+
+func processHookToolCallsToProvider(calls []processHookToolCall) []providers.ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+
+	out := make([]providers.ToolCall, len(calls))
+	for i, call := range calls {
+		out[i] = providers.ToolCall{
+			ID:               call.ID,
+			Type:             call.Type,
+			Name:             call.Name,
+			Arguments:        cloneStringAnyMap(call.Arguments),
+			ThoughtSignature: call.ThoughtSignature,
+			ExtraContent:     cloneProcessHookExtraContent(call.ExtraContent),
+		}
+		if call.Function != nil {
+			function := *call.Function
+			out[i].Function = &function
+			if out[i].ThoughtSignature == "" {
+				out[i].ThoughtSignature = function.ThoughtSignature
+			}
+		}
+		out[i] = providers.NormalizeToolCall(out[i])
+	}
+	return out
+}
+
+func cloneProcessHookExtraContent(extra *providers.ExtraContent) *providers.ExtraContent {
+	if extra == nil {
+		return nil
+	}
+	cloned := *extra
+	if extra.Google != nil {
+		google := *extra.Google
+		cloned.Google = &google
+	}
+	return &cloned
 }
