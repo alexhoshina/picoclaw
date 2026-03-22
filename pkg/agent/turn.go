@@ -259,6 +259,22 @@ func (ts *turnState) recordPersistedMessage(msg providers.Message) {
 	ts.persistedMessages = append(ts.persistedMessages, msg)
 }
 
+func (ts *turnState) persistedMessageCount() int {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return len(ts.persistedMessages)
+}
+
+func (ts *turnState) replacePersistedMessage(index int, msg providers.Message) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	if index < 0 || index >= len(ts.persistedMessages) {
+		return
+	}
+	ts.persistedMessages[index] = msg
+}
+
 func (ts *turnState) refreshRestorePointFromSession(agent *AgentInstance) {
 	history := agent.Sessions.GetHistory(ts.sessionKey)
 	summary := agent.Sessions.GetSummary(ts.sessionKey)

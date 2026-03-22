@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg/media"
 	"github.com/sipeed/picoclaw/pkg/providers"
 	"github.com/sipeed/picoclaw/pkg/routing"
+	"github.com/sipeed/picoclaw/pkg/session"
 	"github.com/sipeed/picoclaw/pkg/skills"
 	"github.com/sipeed/picoclaw/pkg/state"
 	"github.com/sipeed/picoclaw/pkg/tools"
@@ -50,6 +52,7 @@ type AgentLoop struct {
 	cmdRegistry    *commands.Registry
 	mcp            mcpRuntime
 	hookRuntime    hookRuntime
+	turnDrains     *turnDrainTracker
 	steering       *steeringQueue
 	mu             sync.RWMutex
 	activeTurnMu   sync.RWMutex
@@ -121,6 +124,7 @@ func NewAgentLoop(
 		summarizing: sync.Map{},
 		fallback:    fallbackChain,
 		cmdRegistry: commands.NewRegistry(commands.BuiltinDefinitions()),
+		turnDrains:  newTurnDrainTracker(),
 		steering:    newSteeringQueue(parseSteeringMode(cfg.Agents.Defaults.SteeringMode)),
 	}
 	al.hooks = NewHookManager(eventBus)
@@ -816,10 +820,27 @@ func (al *AgentLoop) ReloadProviderAndConfig(
 	// Ensure shared tools are re-registered on the new registry
 	registerSharedTools(cfg, al.bus, registry, provider)
 
+	preparedHooks, err := al.prepareConfiguredHooks(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("prepare hooks for reload: %w", err)
+	}
+
+	// Check context again before proceeding so we can close any prepared hooks
+	// before mutating shared agent state.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		for _, reg := range preparedHooks {
+			closeHookIfPossible(reg.Hook)
+		}
+		return fmt.Errorf("context canceled before reload swap: %w", ctxErr)
+	}
+
 	// Atomically swap the config and registry under write lock
 	// This ensures readers see a consistent pair
+	oldHookNames := al.hookRuntime.snapshotMounted()
 	al.mu.Lock()
 	oldRegistry := al.registry
+	oldConfig := al.cfg
+	oldFallback := al.fallback
 
 	// Store new values
 	al.cfg = cfg
@@ -830,8 +851,22 @@ func (al *AgentLoop) ReloadProviderAndConfig(
 
 	al.mu.Unlock()
 
-	al.hookRuntime.reset(al)
 	configureHookManagerFromConfig(al.hooks, cfg)
+	hooksToClose, err := al.applyConfiguredHooks(preparedHooks, oldHookNames)
+	if err != nil {
+		for _, reg := range preparedHooks {
+			closeHookIfPossible(reg.Hook)
+		}
+		al.mu.Lock()
+		al.cfg = oldConfig
+		al.registry = oldRegistry
+		al.fallback = oldFallback
+		al.mu.Unlock()
+
+		configureHookManagerFromConfig(al.hooks, oldConfig)
+		return fmt.Errorf("apply reloaded hooks: %w", err)
+	}
+	al.deferCloseConfiguredHooks(hooksToClose)
 
 	// Close old provider after releasing the lock
 	// This prevents blocking readers while closing
@@ -1293,6 +1328,12 @@ func (al *AgentLoop) runAgentLoop(
 	agent *AgentInstance,
 	opts processOptions,
 ) (string, error) {
+	var turnEpoch uint64
+	if al != nil && al.turnDrains != nil {
+		turnEpoch = al.turnDrains.beginTurn()
+		defer al.turnDrains.endTurn(turnEpoch)
+	}
+
 	if opts.Channel != "" && opts.ChatID != "" && !constants.IsInternalChannel(opts.Channel) {
 		channelKey := fmt.Sprintf("%s:%s", opts.Channel, opts.ChatID)
 		if err := al.RecordLastChannel(channelKey); err != nil {
@@ -1634,7 +1675,7 @@ turnLoop:
 				"tools_count":       len(providerToolDefs),
 				"max_tokens":        ts.agent.MaxTokens,
 				"temperature":       ts.agent.Temperature,
-				"system_prompt_len": len(callMessages[0].Content),
+				"system_prompt_len": systemPromptLen(callMessages),
 			})
 		logger.DebugCF("agent", "Full LLM request",
 			map[string]any{
@@ -1655,9 +1696,10 @@ turnLoop:
 			defer al.activeRequests.Done()
 
 			if len(activeCandidates) > 1 && al.fallback != nil {
+				fallbackCandidates := al.rewriteFallbackCandidates(activeCandidates, llmModel)
 				fbResult, fbErr := al.fallback.Execute(
 					providerCtx,
-					activeCandidates,
+					fallbackCandidates,
 					func(ctx context.Context, provider, model string) (*providers.LLMResponse, error) {
 						return ts.agent.Provider.Chat(ctx, messagesForCall, toolDefsForCall, model, llmOpts)
 					},
@@ -1911,28 +1953,16 @@ turnLoop:
 			ReasoningContent: response.ReasoningContent,
 		}
 		for _, tc := range normalizedToolCalls {
-			argumentsJSON, _ := json.Marshal(tc.Arguments)
-			extraContent := tc.ExtraContent
-			thoughtSignature := ""
-			if tc.Function != nil {
-				thoughtSignature = tc.Function.ThoughtSignature
-			}
-			assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, providers.ToolCall{
-				ID:   tc.ID,
-				Type: "function",
-				Name: tc.Name,
-				Function: &providers.FunctionCall{
-					Name:             tc.Name,
-					Arguments:        string(argumentsJSON),
-					ThoughtSignature: thoughtSignature,
-				},
-				ExtraContent:     extraContent,
-				ThoughtSignature: thoughtSignature,
-			})
+			assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, assistantMessageToolCall(tc, tc.Name, tc.Arguments))
 		}
 		messages = append(messages, assistantMsg)
+		assistantMsgIndex := len(messages) - 1
+		assistantHistoryIndex := -1
+		assistantPersistedIndex := -1
 		if !ts.opts.NoHistory {
+			assistantHistoryIndex = len(ts.agent.Sessions.GetHistory(ts.sessionKey))
 			ts.agent.Sessions.AddFullMessage(ts.sessionKey, assistantMsg)
+			assistantPersistedIndex = ts.persistedMessageCount()
 			ts.recordPersistedMessage(assistantMsg)
 		}
 
@@ -1957,8 +1987,22 @@ turnLoop:
 				switch decision.normalizedAction() {
 				case HookActionContinue, HookActionModify:
 					if toolReq != nil {
+						rewroteToolCall := toolReq.Tool != toolName || !reflect.DeepEqual(toolReq.Arguments, toolArgs)
 						toolName = toolReq.Tool
 						toolArgs = toolReq.Arguments
+						if rewroteToolCall {
+							assistantMsg.ToolCalls[i] = assistantMessageToolCall(tc, toolName, toolArgs)
+							messages[assistantMsgIndex] = assistantMsg
+							if !ts.opts.NoHistory {
+								replaceSessionHistoryMessage(
+									ts.agent.Sessions,
+									ts.sessionKey,
+									assistantHistoryIndex,
+									assistantMsg,
+								)
+								ts.replacePersistedMessage(assistantPersistedIndex, assistantMsg)
+							}
+						}
 					}
 				case HookActionDenyTool:
 					denyContent := hookDeniedToolContent("Tool execution denied by hook", decision.Reason)
@@ -2375,6 +2419,129 @@ func (al *AgentLoop) selectCandidates(
 			"threshold":   agent.Router.Threshold(),
 		})
 	return agent.LightCandidates, agent.Router.LightModel()
+}
+
+func systemPromptLen(messages []providers.Message) int {
+	if len(messages) == 0 {
+		return 0
+	}
+	return len(messages[0].Content)
+}
+
+func (al *AgentLoop) rewriteFallbackCandidates(
+	candidates []providers.FallbackCandidate,
+	model string,
+) []providers.FallbackCandidate {
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return append([]providers.FallbackCandidate(nil), candidates...)
+	}
+
+	resolvedModel := model
+	if cfg := al.GetConfig(); cfg != nil {
+		ensureProtocol := func(raw string) string {
+			raw = strings.TrimSpace(raw)
+			if raw == "" || strings.Contains(raw, "/") {
+				return raw
+			}
+			return "openai/" + raw
+		}
+
+		if mc, err := cfg.GetModelConfig(model); err == nil && mc != nil && strings.TrimSpace(mc.Model) != "" {
+			resolvedModel = ensureProtocol(mc.Model)
+		} else {
+			for i := range cfg.ModelList {
+				fullModel := strings.TrimSpace(cfg.ModelList[i].Model)
+				if fullModel == "" {
+					continue
+				}
+				if fullModel == model {
+					resolvedModel = ensureProtocol(fullModel)
+					break
+				}
+				_, modelID := providers.ExtractProtocol(fullModel)
+				if modelID == model {
+					resolvedModel = ensureProtocol(fullModel)
+					break
+				}
+			}
+		}
+	}
+
+	defaultProvider := candidates[0].Provider
+	if defaultProvider == "" {
+		if cfg := al.GetConfig(); cfg != nil {
+			defaultProvider = cfg.Agents.Defaults.Provider
+		}
+	}
+	ref := providers.ParseModelRef(resolvedModel, defaultProvider)
+	if ref == nil {
+		return append([]providers.FallbackCandidate(nil), candidates...)
+	}
+
+	rewritten := make([]providers.FallbackCandidate, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	addCandidate := func(candidate providers.FallbackCandidate) {
+		key := providers.ModelKey(candidate.Provider, candidate.Model)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		rewritten = append(rewritten, candidate)
+	}
+
+	addCandidate(providers.FallbackCandidate{
+		Provider: ref.Provider,
+		Model:    ref.Model,
+	})
+	for _, candidate := range candidates[1:] {
+		addCandidate(candidate)
+	}
+
+	return rewritten
+}
+
+func assistantMessageToolCall(tc providers.ToolCall, toolName string, toolArgs map[string]any) providers.ToolCall {
+	messageToolCall := providers.NormalizeToolCall(tc)
+	messageToolCall.Type = "function"
+	messageToolCall.Name = toolName
+	messageToolCall.Arguments = cloneStringAnyMap(toolArgs)
+
+	argumentsJSON, _ := json.Marshal(messageToolCall.Arguments)
+	thoughtSignature := messageToolCall.ThoughtSignature
+	if messageToolCall.Function != nil && thoughtSignature == "" {
+		thoughtSignature = messageToolCall.Function.ThoughtSignature
+	}
+	messageToolCall.Function = &providers.FunctionCall{
+		Name:             toolName,
+		Arguments:        string(argumentsJSON),
+		ThoughtSignature: thoughtSignature,
+	}
+	messageToolCall.ThoughtSignature = thoughtSignature
+	return messageToolCall
+}
+
+func replaceSessionHistoryMessage(
+	store session.SessionStore,
+	sessionKey string,
+	index int,
+	msg providers.Message,
+) {
+	if store == nil || index < 0 {
+		return
+	}
+
+	history := store.GetHistory(sessionKey)
+	if index >= len(history) {
+		return
+	}
+
+	history[index] = msg
+	store.SetHistory(sessionKey, history)
 }
 
 // maybeSummarize triggers summarization if the session history exceeds thresholds.

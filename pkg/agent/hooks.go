@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -708,6 +709,12 @@ func cloneProviderMessages(messages []providers.Message) []providers.Message {
 		}
 		if len(msg.SystemParts) > 0 {
 			cloned[i].SystemParts = append([]providers.ContentBlock(nil), msg.SystemParts...)
+			for j := range cloned[i].SystemParts {
+				if msg.SystemParts[j].CacheControl != nil {
+					cacheControl := *msg.SystemParts[j].CacheControl
+					cloned[i].SystemParts[j].CacheControl = &cacheControl
+				}
+			}
 		}
 		if len(msg.ToolCalls) > 0 {
 			cloned[i].ToolCalls = cloneProviderToolCalls(msg.ToolCalls)
@@ -779,9 +786,86 @@ func cloneStringAnyMap(src map[string]any) map[string]any {
 
 	cloned := make(map[string]any, len(src))
 	for k, v := range src {
-		cloned[k] = v
+		cloned[k] = cloneDynamicValue(v)
 	}
 	return cloned
+}
+
+func cloneDynamicValue(v any) any {
+	switch typed := v.(type) {
+	case nil:
+		return nil
+	case map[string]any:
+		return cloneStringAnyMap(typed)
+	case []any:
+		cloned := make([]any, len(typed))
+		for i, item := range typed {
+			cloned[i] = cloneDynamicValue(item)
+		}
+		return cloned
+	}
+
+	rv := reflect.ValueOf(v)
+	if !rv.IsValid() {
+		return nil
+	}
+
+	switch rv.Kind() {
+	case reflect.Map:
+		if rv.IsNil() {
+			return v
+		}
+		cloned := reflect.MakeMapWithSize(rv.Type(), rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			cloned.SetMapIndex(iter.Key(), cloneReflectValue(iter.Value(), rv.Type().Elem()))
+		}
+		return cloned.Interface()
+	case reflect.Slice:
+		if rv.IsNil() {
+			return v
+		}
+		cloned := reflect.MakeSlice(rv.Type(), rv.Len(), rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			cloned.Index(i).Set(cloneReflectValue(rv.Index(i), rv.Type().Elem()))
+		}
+		return cloned.Interface()
+	case reflect.Array:
+		cloned := reflect.New(rv.Type()).Elem()
+		for i := 0; i < rv.Len(); i++ {
+			cloned.Index(i).Set(cloneReflectValue(rv.Index(i), rv.Type().Elem()))
+		}
+		return cloned.Interface()
+	case reflect.Pointer:
+		if rv.IsNil() {
+			return v
+		}
+		cloned := reflect.New(rv.Type().Elem())
+		cloned.Elem().Set(cloneReflectValue(rv.Elem(), rv.Type().Elem()))
+		return cloned.Interface()
+	default:
+		return v
+	}
+}
+
+func cloneReflectValue(v reflect.Value, target reflect.Type) reflect.Value {
+	if !v.IsValid() {
+		return reflect.Zero(target)
+	}
+
+	cloned := cloneDynamicValue(v.Interface())
+	if cloned == nil {
+		return reflect.Zero(target)
+	}
+
+	clonedValue := reflect.ValueOf(cloned)
+	if clonedValue.Type().AssignableTo(target) {
+		return clonedValue
+	}
+	if clonedValue.Type().ConvertibleTo(target) {
+		return clonedValue.Convert(target)
+	}
+	return v
 }
 
 func cloneToolResult(result *tools.ToolResult) *tools.ToolResult {

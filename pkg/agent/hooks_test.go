@@ -83,6 +83,7 @@ func TestHookManager_SortsInProcessBeforeProcess(t *testing.T) {
 type llmHookTestProvider struct {
 	mu        sync.Mutex
 	lastModel string
+	lastMsgN  int
 }
 
 func (p *llmHookTestProvider) Chat(
@@ -94,6 +95,7 @@ func (p *llmHookTestProvider) Chat(
 ) (*providers.LLMResponse, error) {
 	p.mu.Lock()
 	p.lastModel = model
+	p.lastMsgN = len(messages)
 	p.mu.Unlock()
 
 	return &providers.LLMResponse{
@@ -177,6 +179,134 @@ func TestAgentLoop_Hooks_ObserverAndLLMInterceptor(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for hook observer event")
+	}
+}
+
+type clearMessagesHook struct{}
+
+func (h *clearMessagesHook) BeforeLLM(
+	ctx context.Context,
+	req *LLMHookRequest,
+) (*LLMHookRequest, HookDecision, error) {
+	next := req.Clone()
+	next.Messages = nil
+	return next, HookDecision{Action: HookActionModify}, nil
+}
+
+func (h *clearMessagesHook) AfterLLM(
+	ctx context.Context,
+	resp *LLMHookResponse,
+) (*LLMHookResponse, HookDecision, error) {
+	return resp, HookDecision{Action: HookActionContinue}, nil
+}
+
+func TestAgentLoop_Hooks_BeforeLLMCanClearMessagesWithoutPanic(t *testing.T) {
+	provider := &llmHookTestProvider{}
+	al, agent, cleanup := newHookTestLoop(t, provider)
+	defer cleanup()
+
+	if err := al.MountHook(NamedHook("clear-messages", &clearMessagesHook{})); err != nil {
+		t.Fatalf("MountHook failed: %v", err)
+	}
+
+	resp, err := al.runAgentLoop(context.Background(), agent, processOptions{
+		SessionKey:      "session-1",
+		Channel:         "cli",
+		ChatID:          "direct",
+		UserMessage:     "hello",
+		DefaultResponse: defaultResponse,
+		EnableSummary:   false,
+		SendResponse:    false,
+	})
+	if err != nil {
+		t.Fatalf("runAgentLoop failed: %v", err)
+	}
+	if resp != "provider content" {
+		t.Fatalf("expected provider content, got %q", resp)
+	}
+
+	provider.mu.Lock()
+	lastMsgN := provider.lastMsgN
+	provider.mu.Unlock()
+	if lastMsgN != 0 {
+		t.Fatalf("expected provider to receive 0 messages, got %d", lastMsgN)
+	}
+}
+
+type modelRewriteHook struct {
+	model string
+}
+
+func (h *modelRewriteHook) BeforeLLM(
+	ctx context.Context,
+	req *LLMHookRequest,
+) (*LLMHookRequest, HookDecision, error) {
+	next := req.Clone()
+	next.Model = h.model
+	return next, HookDecision{Action: HookActionModify}, nil
+}
+
+func (h *modelRewriteHook) AfterLLM(
+	ctx context.Context,
+	resp *LLMHookResponse,
+) (*LLMHookResponse, HookDecision, error) {
+	return resp, HookDecision{Action: HookActionContinue}, nil
+}
+
+func TestAgentLoop_Hooks_BeforeLLMModelRewriteHonoredWithFallbacks(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-hooks-fallback-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Provider:          "openai",
+				Model:             "primary-model",
+				ModelFallbacks:    []string{"backup-model"},
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	provider := &llmHookTestProvider{}
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), provider)
+	defer al.Close()
+
+	agent := al.registry.GetDefaultAgent()
+	if agent == nil {
+		t.Fatal("expected default agent")
+	}
+
+	if mountErr := al.MountHook(NamedHook("rewrite-model", &modelRewriteHook{model: "hook-model"})); mountErr != nil {
+		t.Fatalf("MountHook failed: %v", mountErr)
+	}
+
+	resp, err := al.runAgentLoop(context.Background(), agent, processOptions{
+		SessionKey:      "session-1",
+		Channel:         "cli",
+		ChatID:          "direct",
+		UserMessage:     "hello",
+		DefaultResponse: defaultResponse,
+		EnableSummary:   false,
+		SendResponse:    false,
+	})
+	if err != nil {
+		t.Fatalf("runAgentLoop failed: %v", err)
+	}
+	if resp != "provider content" {
+		t.Fatalf("expected provider content, got %q", resp)
+	}
+
+	provider.mu.Lock()
+	lastModel := provider.lastModel
+	provider.mu.Unlock()
+	if lastModel != "hook-model" {
+		t.Fatalf("expected fallback call to use rewritten model, got %q", lastModel)
 	}
 }
 
@@ -288,6 +418,199 @@ func TestAgentLoop_Hooks_ToolInterceptorCanRewrite(t *testing.T) {
 	}
 	if resp != "after:modified" {
 		t.Fatalf("expected rewritten tool result, got %q", resp)
+	}
+}
+
+type beforeToolOnlyRewriteHook struct{}
+
+func (h *beforeToolOnlyRewriteHook) BeforeTool(
+	ctx context.Context,
+	call *ToolCallHookRequest,
+) (*ToolCallHookRequest, HookDecision, error) {
+	next := call.Clone()
+	next.Arguments["text"] = "modified"
+	return next, HookDecision{Action: HookActionModify}, nil
+}
+
+func (h *beforeToolOnlyRewriteHook) AfterTool(
+	ctx context.Context,
+	result *ToolResultHookResponse,
+) (*ToolResultHookResponse, HookDecision, error) {
+	return result, HookDecision{Action: HookActionContinue}, nil
+}
+
+type toolTranscriptProvider struct {
+	calls int
+}
+
+func (p *toolTranscriptProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	p.calls++
+	if p.calls == 1 {
+		return &providers.LLMResponse{
+			ToolCalls: []providers.ToolCall{
+				{
+					ID:        "call-1",
+					Name:      "echo_text",
+					Arguments: map[string]any{"text": "original"},
+				},
+			},
+		}, nil
+	}
+
+	for i := len(messages) - 1; i >= 0; i-- {
+		if len(messages[i].ToolCalls) == 0 {
+			continue
+		}
+		return &providers.LLMResponse{
+			Content: messages[i].ToolCalls[0].Function.Arguments,
+		}, nil
+	}
+
+	return &providers.LLMResponse{Content: "missing transcript"}, nil
+}
+
+func (p *toolTranscriptProvider) GetDefaultModel() string {
+	return "tool-transcript-provider"
+}
+
+func TestAgentLoop_Hooks_BeforeToolRewriteUpdatesTranscript(t *testing.T) {
+	provider := &toolTranscriptProvider{}
+	al, agent, cleanup := newHookTestLoop(t, provider)
+	defer cleanup()
+
+	al.RegisterTool(&echoTextTool{})
+	if err := al.MountHook(NamedHook("before-tool-only", &beforeToolOnlyRewriteHook{})); err != nil {
+		t.Fatalf("MountHook failed: %v", err)
+	}
+
+	resp, err := al.runAgentLoop(context.Background(), agent, processOptions{
+		SessionKey:      "session-1",
+		Channel:         "cli",
+		ChatID:          "direct",
+		UserMessage:     "run tool",
+		DefaultResponse: defaultResponse,
+		EnableSummary:   false,
+		SendResponse:    false,
+	})
+	if err != nil {
+		t.Fatalf("runAgentLoop failed: %v", err)
+	}
+	if resp != `{"text":"modified"}` {
+		t.Fatalf("expected rewritten tool call in transcript, got %q", resp)
+	}
+}
+
+type nestedToolProvider struct {
+	calls int
+}
+
+func (p *nestedToolProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	p.calls++
+	if p.calls == 1 {
+		return &providers.LLMResponse{
+			ToolCalls: []providers.ToolCall{
+				{
+					ID:   "call-1",
+					Name: "nested_echo",
+					Arguments: map[string]any{
+						"payload": map[string]any{"text": "original"},
+					},
+				},
+			},
+		}, nil
+	}
+
+	return &providers.LLMResponse{
+		Content: messages[len(messages)-1].Content,
+	}, nil
+}
+
+func (p *nestedToolProvider) GetDefaultModel() string {
+	return "nested-tool-provider"
+}
+
+type nestedEchoTool struct{}
+
+func (t *nestedEchoTool) Name() string {
+	return "nested_echo"
+}
+
+func (t *nestedEchoTool) Description() string {
+	return "echo nested payload text"
+}
+
+func (t *nestedEchoTool) Parameters() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"payload": map[string]any{
+				"type": "object",
+			},
+		},
+	}
+}
+
+func (t *nestedEchoTool) Execute(ctx context.Context, args map[string]any) *tools.ToolResult {
+	payload, _ := args["payload"].(map[string]any)
+	text, _ := payload["text"].(string)
+	return tools.SilentResult(text)
+}
+
+type nestedArgumentMutationHook struct{}
+
+func (h *nestedArgumentMutationHook) BeforeTool(
+	ctx context.Context,
+	call *ToolCallHookRequest,
+) (*ToolCallHookRequest, HookDecision, error) {
+	if payload, ok := call.Arguments["payload"].(map[string]any); ok {
+		payload["text"] = "mutated"
+	}
+	return nil, HookDecision{Action: HookActionContinue}, nil
+}
+
+func (h *nestedArgumentMutationHook) AfterTool(
+	ctx context.Context,
+	result *ToolResultHookResponse,
+) (*ToolResultHookResponse, HookDecision, error) {
+	return result, HookDecision{Action: HookActionContinue}, nil
+}
+
+func TestAgentLoop_Hooks_NestedArgumentsAreIsolatedFromHookMutation(t *testing.T) {
+	provider := &nestedToolProvider{}
+	al, agent, cleanup := newHookTestLoop(t, provider)
+	defer cleanup()
+
+	al.RegisterTool(&nestedEchoTool{})
+	if err := al.MountHook(NamedHook("nested-arg-mutation", &nestedArgumentMutationHook{})); err != nil {
+		t.Fatalf("MountHook failed: %v", err)
+	}
+
+	resp, err := al.runAgentLoop(context.Background(), agent, processOptions{
+		SessionKey:      "session-1",
+		Channel:         "cli",
+		ChatID:          "direct",
+		UserMessage:     "run nested tool",
+		DefaultResponse: defaultResponse,
+		EnableSummary:   false,
+		SendResponse:    false,
+	})
+	if err != nil {
+		t.Fatalf("runAgentLoop failed: %v", err)
+	}
+	if resp != "original" {
+		t.Fatalf("expected nested arguments to stay isolated, got %q", resp)
 	}
 }
 
